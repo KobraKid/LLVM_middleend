@@ -57,8 +57,8 @@ namespace {
 
 			if (c_add > 0) { errs() << "H1: \"" << F.getName() << "\": CAT_add: " << c_add << "\n"; }
 			if (c_sub > 0) { errs() << "H1: \"" << F.getName() << "\": CAT_sub: " << c_sub << "\n"; }
+			if (c_new > 0) { errs() << "H1: \"" << F.getName() << "\": CAT_new: " << c_new << "\n"; }
 			if (c_get > 0) { errs() << "H1: \"" << F.getName() << "\": CAT_get: " << c_get << "\n"; }
-			if (c_new > 0) { errs() << "H1: \"" << F.getName() << "\": CAT_new: " << c_new << "\n"; } // This should be moved up according to the reference sheet
 			if (c_set > 0) { errs() << "H1: \"" << F.getName() << "\": CAT_set: " << c_set << "\n"; }
 			return false;
 		}

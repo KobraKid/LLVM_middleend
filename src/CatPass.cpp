@@ -2,15 +2,10 @@
 ///
 /// A custom LLVM pass for dealing with "CAT" variables.
 ///
-/// TODO:
-/// test74
-/// test73
-/// test72
-/// test71
-///
 /// Michael Huyler
 
 #include "llvm/ADT/BitVector.h"
+#include "llvm/Analysis/AliasAnalysis.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/CFG.h"
 #include "llvm/IR/Dominators.h"
@@ -63,17 +58,18 @@ namespace {
 		BitVector* get_out() {
 			return &m_out;
 		};
-		Value* getAlias() { return alias; }
+		BitVector* getAliases() { return &aliases; }
+		void print(std::vector<DFA_SET*>* dfa);
+		bool escapes();
 		// Convenience functions to add Instructions to SETs
 		void add(const int i, const int set);
 		void add(const BitVector* i, const int set);
-		void addAlias(Value* a);
-		void print(std::vector<DFA_SET*>* dfa);
 		// SET modification flags
 		const static int GEN{ 0 };
 		const static int KILL{ 1 };
 		const static int IN{ 2 };
 		const static int OUT{ 3 };
+		const static int ALIAS{ 4 };
 	private:
 		Instruction* m_inst;
 		// SETs
@@ -81,7 +77,7 @@ namespace {
 		BitVector m_kill;
 		BitVector m_in;
 		BitVector m_out;
-		Value* alias;
+		BitVector aliases;
 	};
 
 	/// <summary>Adds an <c>Instruction</c> to a SET.</summary>
@@ -113,6 +109,12 @@ namespace {
 			}
 			m_out.set(i);
 			break;
+		case ALIAS:
+			if (aliases.size() < i + 1) {
+				aliases.resize(i + 1);
+			}
+			aliases.set(i);
+			break;
 		default:
 			// errs() << ">>>> Invalid set ID: " << set << "\n";
 			break;
@@ -131,13 +133,9 @@ namespace {
 	}
 
 	/// <summary>
-	/// Stores a Value which this DFA_SET's Instruction aliases.
+	/// Prints IN and OUT sets for a particular Instruction.
 	/// </summary>
-	/// <param name="a">The aliased Value.</param>
-	void DFA_SET::addAlias(Value* a) {
-		alias = a;
-	}
-
+	/// <param name="dfa">The collection of DFA sets to print.</param>
 	void DFA_SET::print(std::vector<DFA_SET*>* dfa) {
 		// errs() << "INSTRUCTION: " << *m_inst << "\n";
 		// errs() << "***************** IN\n";
@@ -159,6 +157,14 @@ namespace {
 		// errs() << "}\n";
 		// errs() << "**************************************\n\n\n\n";
 
+	}
+
+	/// <summary>
+	/// Tests if this instruction defines a CAT variable that escapes.
+	/// </summary>
+	/// <returns>True if this variable has any aliases, false otherwise.</returns>
+	bool DFA_SET::escapes() {
+		return (aliases.find_first() > -1);
 	}
 
 	struct CAT : public FunctionPass {
@@ -273,7 +279,7 @@ namespace {
 		/// <param name='L'>A potential definition <c>Instruction</c>.</param>
 		/// <param name='R'>A <c>Value</c> to be tested.</param>
 		/// <returns>true if <c>L</c> (re)defines <c>R</c>, false otherwise.</returns>
-		bool defines(const Instruction* L, const Value* R) {
+		bool defines(const Instruction* L, const Value* R, AAResults& AA) {
 			// Try to cast L to a CAT API call
 			if (auto callInst = dyn_cast<CallInst>(L)) {
 				auto f_name = callInst->getCalledFunction()->getName();
@@ -297,7 +303,7 @@ namespace {
 				// Thus we must check all non-CAT API calls' args for CAT variables 
 				for (auto i = 0; i < callInst->getNumArgOperands(); i++) {
 					if (callInst->getArgOperand(i) == R) {
-						return true;
+						return mods(AA.getModRefInfo(L, R, 8));
 					}
 				}
 			}
@@ -314,6 +320,63 @@ namespace {
 			return false;
 		}
 
+		void printModRefInfo(ModRefInfo mr) {
+			switch (mr) {
+			case ModRefInfo::ModRef:
+				// errs() << "ModRef";
+				break;
+			case ModRefInfo::MustModRef:
+				// errs() << "MustModRef";
+				break;
+			case ModRefInfo::Mod:
+				// errs() << "Mod";
+				break;
+			case ModRefInfo::Ref:
+				// errs() << "Ref";
+				break;
+			case ModRefInfo::MustMod:
+				// errs() << "MustMod";
+				break;
+			case ModRefInfo::MustRef:
+				// errs() << "MustRef";
+				break;
+			case ModRefInfo::NoModRef:
+				// errs() << "NoModRef";
+				break;
+			}
+			// errs() << "\n";
+		}
+
+		bool mods(ModRefInfo mr) {
+			switch (mr) {
+			case ModRefInfo::ModRef:
+			case ModRefInfo::MustModRef:
+			case ModRefInfo::Mod:
+			case ModRefInfo::MustMod:
+				return true;
+			case ModRefInfo::Ref:
+			case ModRefInfo::MustRef:
+			case ModRefInfo::NoModRef:
+			default:
+				return false;
+			}
+		}
+
+		bool refs(ModRefInfo mr) {
+			switch (mr) {
+			case ModRefInfo::ModRef:
+			case ModRefInfo::MustModRef:
+			case ModRefInfo::Ref:
+			case ModRefInfo::MustRef:
+				return true;
+			case ModRefInfo::Mod:
+			case ModRefInfo::MustMod:
+			case ModRefInfo::NoModRef:
+			default:
+				return false;
+			}
+		}
+
 		// This function is invoked once per function compiled
 		// The LLVM IR of the input functions is ready and it can be analyzed and/or transformed
 		bool runOnFunction(Function& F) override {
@@ -321,6 +384,7 @@ namespace {
 			bool has_modified_code{ false };
 			// Used to check for unreachable code
 			DominatorTree& DT{ getAnalysis<DominatorTreeWrapperPass>().getDomTree() };
+			AAResults& AA{ getAnalysis<AAResultsWrapperPass>().getAAResults() };
 			// Used to hold GEN/KILL/IN/OUT SETs for each Instruction
 			std::vector<DFA_SET*> DFA;
 
@@ -335,7 +399,6 @@ namespace {
 				if (DT.getNode(&B) == NULL) { continue; }
 
 				for (auto& I : B) {
-					// Store GEN/KILL in this object for each instruction
 					DFA_SET* p_dfa{ new DFA_SET(&I) };
 					// errs() << index << ": " << *(p_dfa->getInstruction()) << "\n";
 					p_dfa->add(index, DFA_SET::GEN);
@@ -344,7 +407,7 @@ namespace {
 						auto cat_iter{ find(CAT_API::API.begin(), CAT_API::API.end(), callInst->getCalledFunction()->getName()) };
 						if (cat_iter != CAT_API::API.end() && *cat_iter != "CAT_get") {
 							// Look for any other instructions this one KILLs (and other instructions that KILL this one)
-							for (auto i = 0; i < DFA.size(); i++) {
+							for (auto i = 0; i < index; i++) {
 								if (isKilledBy(DFA[i]->getInstruction(), callInst)) {
 									DFA[i]->add(index, DFA_SET::KILL);
 									p_dfa->add(i, DFA_SET::KILL);
@@ -354,32 +417,25 @@ namespace {
 						}
 						// Check if a non-CAT API function kills a CAT variable
 						else if (cat_iter == CAT_API::API.end()) {
+							// Non-CAT API function calls require memory alias analysis
+							// If a function Mods a CAT variable or any of its aliases,
+							// it KILLs that variable's definition. If there is no MOD,
+							// the CAT variable is unaffected
 							std::vector<Instruction*> aliases;
 							do {
-								for (auto i = 0; i < DFA.size(); i++) {
+								for (auto i = 0; i < index; i++) {
 									auto tempInst = DFA[i]->getInstruction();
 									for (auto j = 0; j < callInst->getNumArgOperands(); j++) {
-										// A function is called on an alias to 
-										if (isa<StoreInst>(tempInst) &&
-											cast<StoreInst>(tempInst)->getPointerOperand() == callInst->getArgOperand(j)) {
-											// Check previous instructions for the original alias and have this function kill it
-											for (auto k = 0; k < i; k++) {
-												if (DFA[k]->getInstruction() == DFA[i]->getAlias()) {
-													DFA[k]->add(index, DFA_SET::KILL);
-													DFA[i]->add(index, DFA_SET::KILL);
-													p_dfa->add(i, DFA_SET::KILL);
-													p_dfa->add(k, DFA_SET::KILL);
-													break;
-												}
-											}
-										}
-										// A function is called on a variable holding the result of `CAT_new`
-										if (callInst->getArgOperand(j) == tempInst &&
-											isa<CallInst>(tempInst) &&
-											cast<CallInst>(tempInst)->getCalledFunction()->getName() == "CAT_new") {
+										// Make sure the CAT variable escapes
+										// errs() << *tempInst << "\n";
+										if (!DFA[i]->escapes()) { continue; }
+										// errs() << "escapes\n";
+										auto mr = AA.getModRefInfo(callInst, tempInst, 8);
+										printModRefInfo(mr);
+										// Make sure this function call modifies the CAT variable
+										if (mods(mr)) {
 											DFA[i]->add(index, DFA_SET::KILL);
 											p_dfa->add(i, DFA_SET::KILL);
-											// errs() << *callInst << " < kills > " << *tempInst << "\n";
 										}
 									}
 								}
@@ -387,22 +443,31 @@ namespace {
 						}
 					}
 					else if (auto phiInst = dyn_cast<PHINode>(&I)) {
-						for (auto i = 0; i < DFA.size(); i++) {
-							if (defines(DFA[i]->getInstruction(), phiInst)) {
+						for (auto i = 0; i < index; i++) {
+							if (defines(DFA[i]->getInstruction(), phiInst, AA)) {
 								DFA[i]->add(index, DFA_SET::KILL);
 								p_dfa->add(i, DFA_SET::KILL);
 							}
 						}
 					}
 					else if (auto storeInst = dyn_cast<StoreInst>(&I)) {
-						// Store instructions GEN themselves (& their pointers?)
-						// Store instructions alias whatever they store
-						p_dfa->addAlias(storeInst->getValueOperand());
-						// errs() << *storeInst << " aliases " << *(storeInst->getValueOperand()) << "\n";
+						int memLoc;
+						for (auto i = 0; i < index; i++) {
+							if (DFA[i]->getInstruction() == storeInst->getPointerOperand()) {
+								memLoc = i;
+								break;
+							}
+						}
+						auto memInst = DFA[memLoc]->getInstruction();
+						for (auto i = 0; i < index; i++) {
+							auto tempInst = DFA[i]->getInstruction();
+							if (tempInst != storeInst->getValueOperand()) { continue; }
+							DFA[i]->add(memLoc, DFA_SET::ALIAS);
+							// errs() << *memInst << " aliases " << *tempInst << "\n";
+						}
 					}
 					else if (auto loadInst = dyn_cast<LoadInst>(&I)) {
-						// Load instructions KILL what they store?
-						for (auto i = 0; i < DFA.size(); i++) {
+						for (auto i = 0; i < index; i++) {
 							auto tempInst = DFA[i]->getInstruction();
 							if (isa<StoreInst>(tempInst) &&
 								loadInst->getPointerOperand() == cast<StoreInst>(tempInst)->getPointerOperand()) {
@@ -430,20 +495,21 @@ namespace {
 					for (auto& I : B) {
 						auto p_dfa{ DFA[index] };
 						BitVector comp{ *(p_dfa->get_out()) };
-						// p_dfa->get_in()->clear();
-						// p_dfa->get_out()->clear();
 						// Generate IN set if this instruction has predecessors
 						// First check if this is a BasicBlock's entry point
 						if (first) {
+							// errs() << *(p_dfa->getInstruction()) << " preds: ";
 							for (auto B : predecessors(&B)) {
 								// Find DFA of predecessor BasicBlock's terminator Instruction
 								for (auto i = 0; i < DFA.size(); i++) {
 									if (DFA[i]->getInstruction() == B->getTerminator()) {
+										// errs() << i << " ";
 										// Add the OUT set of the predecessor to this Instruction's IN set
 										p_dfa->add(DFA[i]->get_out(), DFA_SET::IN);
 									}
 								}
 							}
+							// errs() << "\n";
 						}
 						// If not, then just get the previous instruction
 						else {
@@ -483,7 +549,7 @@ namespace {
 					if (auto callInst = dyn_cast<CallInst>(p_dfa->getInstruction())) {
 						auto f_name{ callInst->getCalledFunction()->getName() };
 						/* Constant Propagation */
-						// errs() << *callInst << "\n";
+						// errs() << "\n" << *callInst << "\n";
 						Value* arg;
 						bool can_prop{ true };
 						bool valset{ false };
@@ -507,7 +573,7 @@ namespace {
 									goto CONST_PROP;
 								}
 							}
-							else if (defines(DFA[i]->getInstruction(), arg)) {
+							else if (defines(DFA[i]->getInstruction(), arg, AA)) {
 								// A definition was not constant
 								// errs() << " defines callInst\n";
 								can_prop = false;
@@ -566,7 +632,7 @@ namespace {
 										break;
 									}
 								}
-								else if (defines(DFA[i]->getInstruction(), binOpArg)) {
+								else if (defines(DFA[i]->getInstruction(), binOpArg, AA)) {
 									// errs() << "does not define callInst's arg " << arg << "  as a constant";
 									// At least one argument has a non-constant definition
 									both_consts = false;
@@ -597,7 +663,6 @@ namespace {
 				ReplaceInstWithValue(prop_iter->first->getParent()->getInstList(), ii, prop_iter->second);
 				has_modified_code = true;
 			}
-			// errs() << "CP: Done\n";
 
 			// Go through the mapping of constant foldings and do them
 			for (auto fold_iter = foldings.begin(); fold_iter != foldings.end(); fold_iter++) {
@@ -623,7 +688,6 @@ namespace {
 				ReplaceInstWithInst(fold_iter->first, CallInst::Create(f, params));
 				has_modified_code = true;
 			}
-			// errs() << "CF: Done\n";
 
 			// Release memory
 			for (auto p_dfa : DFA) { delete p_dfa; }
@@ -635,6 +699,7 @@ namespace {
 		// The LLVM IR of functions isn't ready at this point
 		void getAnalysisUsage(AnalysisUsage& AU) const override {
 			AU.addRequired<DominatorTreeWrapperPass>();
+			AU.addRequired<AAResultsWrapperPass>();
 			AU.setPreservesAll();
 		}
 	};
